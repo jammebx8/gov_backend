@@ -4,6 +4,7 @@ from app.models.scheme import SchemeWithEligibility
 from app.utils.auth import get_current_user
 from app.services.eligibility import refresh_user_eligibility, get_eligible_schemes
 from app.services.embeddings import embed_text, build_user_query_text
+from app.services.summarizer import get_or_create_summary
 from app.database import get_supabase
 
 router = APIRouter(prefix="/schemes", tags=["schemes"])
@@ -82,29 +83,69 @@ async def recommend_for_user(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Personalised scheme recommendations via vector similarity.
+    Personalised scheme recommendations with eligibility awareness.
 
-    Embeds the current user's profile (age, income, state, caste, occupation,
-    extracted document fields) and finds the nearest scheme embeddings.
-    This replaces the slow Groq LLM eligibility batch as the primary
-    recommendation signal on the dashboard.
+    Strategy (in order of preference):
+    1. If the user has eligibility cache (from Groq LLM check), return those
+       eligible schemes sorted by vector similarity to the user profile.
+    2. If no eligibility cache exists, run vector similarity on the user profile
+       and return the nearest schemes (fast path, no LLM call).
+    3. If profile is empty, return popular/latest schemes.
     """
     db = get_supabase()
     user_id = str(current_user["id"])
 
-    # Load user + documents for profile text
+    # ── 1. Check eligibility cache first ──────────────────────────────────
+    elig_result = (
+        db.table("user_eligibility")
+        .select("scheme_id, eligibility_reason, eligible")
+        .eq("user_id", user_id)
+        .eq("eligible", True)
+        .execute()
+    )
+
+    if elig_result.data and len(elig_result.data) > 0:
+        # We have LLM-verified eligible schemes — fetch their full details
+        eligible_ids = [r["scheme_id"] for r in elig_result.data]
+        reason_map   = {r["scheme_id"]: r.get("eligibility_reason", "") for r in elig_result.data}
+
+        q = db.table("government_schemes").select(
+            "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
+        ).in_("id", eligible_ids)
+
+        if category:
+            q = q.eq("scheme_category", category)
+
+        schemes_result = q.limit(limit).execute()
+        schemes = schemes_result.data or []
+
+        # Attach eligibility reason to each scheme
+        for s in schemes:
+            s["eligible"] = True
+            s["eligibility_reason"] = reason_map.get(str(s["id"]), "")
+
+        return {
+            "schemes": schemes,
+            "total": len(schemes),
+            "recommendation_type": "eligible",
+        }
+
+    # ── 2. Vector similarity fallback ─────────────────────────────────────
     docs_result = db.table("user_documents").select("doc_type, extracted_data").eq("user_id", user_id).execute()
     documents = docs_result.data or []
 
     profile_text = build_user_query_text(current_user, documents)
     if not profile_text.strip():
-        # Profile not filled yet — return popular/random schemes
+        # Profile not filled — return latest schemes as fallback
         fallback = db.table("government_schemes").select(
             "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
-        ).limit(limit).execute()
-        return {"schemes": fallback.data or [], "total": len(fallback.data or []), "recommendation_type": "popular"}
+        ).order("created_at", desc=True).limit(limit).execute()
+        return {
+            "schemes": fallback.data or [],
+            "total": len(fallback.data or []),
+            "recommendation_type": "popular",
+        }
 
-    # Embed the user profile (NOT a retrieval query — it's a document embedding)
     user_vec = await embed_text(profile_text, is_query=False)
     vec_literal = _pgvector_literal(user_vec)
 
@@ -222,6 +263,7 @@ async def get_scheme_by_slug(
 
     scheme = result.data
 
+    # Attach eligibility from cache (non-blocking if missing)
     elig_result = (
         db.table("user_eligibility")
         .select("eligible, eligibility_reason")
@@ -233,4 +275,38 @@ async def get_scheme_by_slug(
         scheme["eligible"] = elig_result.data[0]["eligible"]
         scheme["eligibility_reason"] = elig_result.data[0]["eligibility_reason"]
 
+    # Attach AI summary (cached — fast on repeat visits)
+    try:
+        ai = await get_or_create_summary(scheme, db)
+        scheme["summary"]            = ai.get("summary", "")
+        scheme["benefits_simple"]    = ai.get("benefits_simple", "")
+        scheme["eligibility_simple"] = ai.get("eligibility_simple", "")
+        scheme["documents_simple"]   = ai.get("documents_simple", "")
+    except Exception:
+        pass  # never block page load if summarizer fails
+
     return scheme
+
+
+@router.get("/{slug}/summary")
+async def get_scheme_summary(
+    slug: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return (or generate + cache) the AI-simplified summary for a scheme.
+    Used by the frontend when it needs to refresh the summary independently.
+    """
+    db = get_supabase()
+    result = (
+        db.table("government_schemes")
+        .select("*")
+        .eq("slug", slug)
+        .single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Scheme not found")
+
+    ai = await get_or_create_summary(result.data, db)
+    return {"scheme_id": str(result.data["id"]), **ai}
