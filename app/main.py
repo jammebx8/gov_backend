@@ -1,9 +1,19 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
-from app.utils.auth import get_current_user
 from app.routers import auth, users, documents, schemes, applications
+
+# ── Allowed origins ───────────────────────────────────────────────────────────
+# Keep this list in sync with vercel.json headers.source origins.
+# "https://scheme-sarthi-nine.vercel.app" is the production frontend.
+# settings.frontend_url covers local dev and any custom domain set via env var.
+_ALLOWED_ORIGINS = list({
+    "https://scheme-sarthi-nine.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    settings.frontend_url,
+})
 
 app = FastAPI(
     title="GovAssist API",
@@ -13,30 +23,51 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS
-# allow_origins uses explicit origins so credentials work correctly.
-# "*" is intentionally omitted because allow_credentials=True + "*" is
-# forbidden by the CORS spec — browsers would still block it.
-_cors_origins = list({
-    settings.frontend_url,
-    "https://scheme-sarthi-nine.vercel.app",
-    "http://localhost:3000",
-})
-
+# ── CORS middleware ───────────────────────────────────────────────────────────
+# NOTE: allow_origins must be explicit (not "*") when allow_credentials=True,
+# otherwise browsers reject the response per the CORS spec.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
     expose_headers=["*"],
+    max_age=600,  # cache preflight for 10 minutes
 )
 
-# Routers — all mounted under /api/v1
-app.include_router(auth.router, prefix="/api/v1")
-app.include_router(users.router, prefix="/api/v1")
-app.include_router(documents.router, prefix="/api/v1")
-app.include_router(schemes.router, prefix="/api/v1")
+
+# ── Explicit OPTIONS handler ──────────────────────────────────────────────────
+# Vercel's edge sometimes swallows the CORSMiddleware response for preflight
+# requests on cold-start lambdas.  This middleware intercepts every OPTIONS
+# request before it reaches the router and returns the correct headers
+# immediately, guaranteeing the browser never sees a missing CORS header.
+@app.middleware("http")
+async def handle_options_preflight(request: Request, call_next):
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin", "")
+        if origin in _ALLOWED_ORIGINS:
+            return JSONResponse(
+                content=None,
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin":      origin,
+                    "Access-Control-Allow-Methods":     "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers":     "Authorization, Content-Type, Accept, X-Requested-With",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Max-Age":           "600",
+                    "Vary":                             "Origin",
+                },
+            )
+    response = await call_next(request)
+    return response
+
+
+# ── Routers — all mounted under /api/v1 ──────────────────────────────────────
+app.include_router(auth.router,         prefix="/api/v1")
+app.include_router(users.router,        prefix="/api/v1")
+app.include_router(documents.router,    prefix="/api/v1")
+app.include_router(schemes.router,      prefix="/api/v1")
 app.include_router(applications.router, prefix="/api/v1")
 
 
