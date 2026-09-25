@@ -14,12 +14,22 @@ app = FastAPI(
 )
 
 # CORS
+# allow_origins uses explicit origins so credentials work correctly.
+# "*" is intentionally omitted because allow_credentials=True + "*" is
+# forbidden by the CORS spec — browsers would still block it.
+_cors_origins = list({
+    settings.frontend_url,
+    "https://scheme-sarthi-nine.vercel.app",
+    "http://localhost:3000",
+})
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "https://scheme-sarthi-nine.vercel.app"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Routers — all mounted under /api/v1
