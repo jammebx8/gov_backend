@@ -23,11 +23,7 @@ app.add_middleware(
 )
 
 # Routers
-app.include_router(auth.router, prefix="/api/v1")
-app.include_router(users.router, prefix="/api/v1")
-app.include_router(documents.router, prefix="/api/v1")
-app.include_router(schemes.router, prefix="/api/v1")
-app.include_router(applications.router, prefix="/api/v1")
+
 
 
 @app.get("/")
