@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "app/main.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "app/main.py"
+    }
+  ],
+  "env": {
+    "SUPABASE_URL": "@supabase_url",
+    "SUPABASE_ANON_KEY": "@supabase_anon_key",
+    "SUPABASE_SERVICE_ROLE_KEY": "@supabase_service_role_key",
+    "JWT_SECRET": "@jwt_secret",
+    "OPENROUTER_API_KEY": "@openrouter_api_key",
+    "FRONTEND_URL": "@frontend_url",
+    "GROK_MODEL": "x-ai/grok-3",
+    "VISION_MODEL": "qwen/qwen-vl-72b-instruct",
+    "ENVIRONMENT": "production"
+  },
+  "regions": ["bom1"]
+}
