@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from passlib.context import CryptContext
 from app.models.user import UserCreate, UserLogin, TokenResponse, UserProfile
 from app.database import get_supabase
-from app.utils.auth import create_access_token
+from app.utils.auth import create_access_token, get_current_user
 import uuid
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -71,9 +71,5 @@ async def login(body: UserLogin):
 
 
 @router.get("/me", response_model=UserProfile)
-async def get_me(current_user: dict = None):
-    # This endpoint is hit after middleware sets user; imported via dependency in main
-    from app.utils.auth import get_current_user
-    from fastapi import Depends
-    # handled via dependency injection in route
+async def get_me(current_user: dict = Depends(get_current_user)):
     return UserProfile(**current_user)

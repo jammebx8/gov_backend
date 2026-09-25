@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
 from app.utils.auth import get_current_user
+from app.routers import auth, users, documents, schemes
 
 app = FastAPI(
     title="GovAssist API",
@@ -21,8 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
-
+# Routers — all mounted under /api/v1
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(users.router, prefix="/api/v1")
+app.include_router(documents.router, prefix="/api/v1")
+app.include_router(schemes.router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -38,10 +42,3 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
-
-
-# Fix the /auth/me endpoint properly
-@app.get("/api/v1/auth/me")
-async def get_me(current_user: dict = Depends(get_current_user)):
-    from app.models.user import UserProfile
-    return UserProfile(**current_user)
