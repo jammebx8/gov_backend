@@ -3,7 +3,6 @@ from typing import Optional
 from app.models.scheme import SchemeWithEligibility
 from app.utils.auth import get_current_user
 from app.services.eligibility import refresh_user_eligibility, get_eligible_schemes
-from app.services.embeddings import embed_text, build_user_query_text
 from app.services.summarizer import get_or_create_summary
 from app.database import get_supabase
 
@@ -17,11 +16,78 @@ CATEGORIES = [
     "Financial Inclusion",
 ]
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# Occupation → likely relevant categories (used for profile-based matching)
+_OCC_CATEGORIES: dict[str, list[str]] = {
+    "farmer":    ["Agriculture", "Financial Inclusion", "Housing"],
+    "student":   ["Education", "Scholarship", "Skill Development"],
+    "business":  ["Business & MSME", "Financial Inclusion", "Skill Development"],
+    "labourer":  ["Social Welfare", "Employment", "Health"],
+    "self-employed": ["Business & MSME", "Financial Inclusion"],
+    "unemployed":    ["Employment", "Skill Development", "Social Welfare"],
+    "government":    ["Pension", "Health", "Housing"],
+    "teacher":       ["Education", "Pension"],
+}
+
+# Caste → likely relevant categories
+_CASTE_CATEGORIES: dict[str, list[str]] = {
+    "SC":  ["Social Welfare", "Scholarship", "Housing", "Financial Inclusion", "Minority Welfare"],
+    "ST":  ["Social Welfare", "Scholarship", "Housing", "Financial Inclusion", "Minority Welfare"],
+    "OBC": ["Social Welfare", "Scholarship", "Employment", "Business & MSME"],
+    "EWS": ["Housing", "Financial Inclusion", "Scholarship", "Health"],
+}
+
 
 def _pgvector_literal(vec: list[float]) -> str:
-    """Format a Python list as a pgvector literal string for RPC calls."""
     return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+
+
+def _profile_category_hints(user: dict) -> list[str]:
+    """
+    Derive a prioritised list of scheme categories from the user's profile
+    without any ML — purely rule-based.  Used as the fast recommendation
+    fallback when the ONNX embedding model is unavailable on Vercel.
+    """
+    cats: list[str] = []
+
+    # Occupation-based
+    occ = (user.get("occupation") or "").lower()
+    for key, cat_list in _OCC_CATEGORIES.items():
+        if key in occ:
+            cats.extend(cat_list)
+
+    # Flag-based
+    if user.get("is_student"):
+        cats.extend(["Education", "Scholarship", "Skill Development"])
+    if user.get("is_farmer"):
+        cats.extend(["Agriculture", "Financial Inclusion", "Housing"])
+    if user.get("disability_status"):
+        cats.extend(["Differently Abled", "Social Welfare", "Health"])
+
+    # Caste-based
+    caste = (user.get("caste_category") or "").upper()
+    cats.extend(_CASTE_CATEGORIES.get(caste, []))
+
+    # Income-based
+    income = user.get("annual_income") or 0
+    if income < 150000:
+        cats.extend(["Social Welfare", "Financial Inclusion", "Health", "Housing"])
+
+    # Gender-based
+    gender = (user.get("gender") or "").lower()
+    if gender == "female":
+        cats.extend(["Women & Child", "Scholarship", "Social Welfare"])
+
+    # Always add some broad safety-net categories
+    cats.extend(["Health", "Employment", "Social Welfare"])
+
+    # Deduplicate while preserving order (most relevant first)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
 
 
 # ── endpoints ────────────────────────────────────────────────────────────────
@@ -40,39 +106,56 @@ async def vector_search(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Semantic vector search over government schemes.
-
-    The query string is embedded in real-time with BAAI/bge-small-en-v1.5
-    and compared against pre-computed scheme embeddings stored in the
-    `embedding` (vector) column using cosine similarity via pgvector HNSW.
-
-    Falls back to full-text search (search_vector tsvector column) when
-    a scheme has no embedding yet.
+    Semantic vector search.  Tries pgvector first; falls back to tsvector
+    full-text search if ONNX embedding is unavailable on this instance.
     """
-    # Embed the query (is_query=True adds the BGE retrieval prefix)
-    query_vec = await embed_text(q, is_query=True)
-    vec_literal = _pgvector_literal(query_vec)
-
     db = get_supabase()
 
-    # Build category / level filter fragment for the RPC
-    # We call a Postgres function so we can use the HNSW index efficiently
-    rpc_params: dict = {
-        "query_embedding": vec_literal,
-        "match_count": limit,
-        "category_filter": category,
-        "level_filter": level,
-    }
+    # ── try vector path ───────────────────────────────────────────────────
+    try:
+        from app.services.embeddings import embed_text
+        import asyncio
 
-    result = db.rpc("search_schemes_by_embedding", rpc_params).execute()
+        query_vec  = await asyncio.wait_for(embed_text(q, is_query=True), timeout=8.0)
+        vec_literal = _pgvector_literal(query_vec)
+
+        rpc_params: dict = {
+            "query_embedding": vec_literal,
+            "match_count": limit,
+            "category_filter": category,
+            "level_filter": level,
+        }
+        result = db.rpc("search_schemes_by_embedding", rpc_params).execute()
+        schemes = result.data or []
+
+        if schemes:
+            return {
+                "schemes": schemes,
+                "query": q,
+                "total": len(schemes),
+                "search_type": "vector",
+            }
+    except Exception:
+        pass  # fall through to tsvector
+
+    # ── tsvector fallback ─────────────────────────────────────────────────
+    qb = db.table("government_schemes").select(
+        "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
+    ).text_search("search_vector", q)
+
+    if category:
+        qb = qb.eq("scheme_category", category)
+    if level:
+        qb = qb.eq("level", level)
+
+    result = qb.limit(limit).execute()
     schemes = result.data or []
 
-    # Attach similarity score as a convenience field
     return {
         "schemes": schemes,
         "query": q,
         "total": len(schemes),
-        "search_type": "vector",
+        "search_type": "fulltext",
     }
 
 
@@ -83,19 +166,16 @@ async def recommend_for_user(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Personalised scheme recommendations with eligibility awareness.
+    Personalised scheme recommendations — three-tier strategy:
 
-    Strategy (in order of preference):
-    1. If the user has eligibility cache (from Groq LLM check), return those
-       eligible schemes sorted by vector similarity to the user profile.
-    2. If no eligibility cache exists, run vector similarity on the user profile
-       and return the nearest schemes (fast path, no LLM call).
-    3. If profile is empty, return popular/latest schemes.
+    1. Eligibility cache (LLM-verified) — fastest, most accurate.
+    2. Profile-based category matching — rule-based, instant, no ML needed.
+    3. Latest schemes fallback — when profile is completely empty.
     """
     db = get_supabase()
     user_id = str(current_user["id"])
 
-    # ── 1. Check eligibility cache first ──────────────────────────────────
+    # ── 1. LLM eligibility cache ──────────────────────────────────────────
     elig_result = (
         db.table("user_eligibility")
         .select("scheme_id, eligibility_reason, eligible")
@@ -104,25 +184,25 @@ async def recommend_for_user(
         .execute()
     )
 
-    if elig_result.data and len(elig_result.data) > 0:
-        # We have LLM-verified eligible schemes — fetch their full details
+    if elig_result.data:
         eligible_ids = [r["scheme_id"] for r in elig_result.data]
-        reason_map   = {r["scheme_id"]: r.get("eligibility_reason", "") for r in elig_result.data}
+        reason_map   = {r["scheme_id"]: r.get("eligibility_reason", "")
+                        for r in elig_result.data}
 
-        q = db.table("government_schemes").select(
-            "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
+        qb = db.table("government_schemes").select(
+            "id, scheme_name, slug, details, benefits, eligibility, "
+            "level, scheme_category, tags, application, documents"
         ).in_("id", eligible_ids)
 
         if category:
-            q = q.eq("scheme_category", category)
+            qb = qb.eq("scheme_category", category)
 
-        schemes_result = q.limit(limit).execute()
+        schemes_result = qb.limit(limit).execute()
         schemes = schemes_result.data or []
 
-        # Attach eligibility reason to each scheme
         for s in schemes:
-            s["eligible"] = True
-            s["eligibility_reason"] = reason_map.get(str(s["id"]), "")
+            s["eligible"]            = True
+            s["eligibility_reason"]  = reason_map.get(str(s["id"]), "")
 
         return {
             "schemes": schemes,
@@ -130,39 +210,57 @@ async def recommend_for_user(
             "recommendation_type": "eligible",
         }
 
-    # ── 2. Vector similarity fallback ─────────────────────────────────────
-    docs_result = db.table("user_documents").select("doc_type, extracted_data").eq("user_id", user_id).execute()
-    documents = docs_result.data or []
+    # ── 2. Profile-based category matching (no ONNX) ──────────────────────
+    # Derive categories from occupation / caste / income / gender / flags.
+    # Then fetch schemes from those categories in priority order.
+    hint_cats = _profile_category_hints(current_user)
 
-    profile_text = build_user_query_text(current_user, documents)
-    if not profile_text.strip():
-        # Profile not filled — return latest schemes as fallback
-        fallback = db.table("government_schemes").select(
-            "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
-        ).order("created_at", desc=True).limit(limit).execute()
-        return {
-            "schemes": fallback.data or [],
-            "total": len(fallback.data or []),
-            "recommendation_type": "popular",
-        }
+    if hint_cats:
+        # Build a prioritised result: fetch up to ceil(limit/len) per category
+        # so the top categories dominate the list.
+        per_cat   = max(3, (limit // max(len(hint_cats[:6]), 1)) + 1)
+        collected: list[dict] = []
+        seen_ids:  set[str]   = set()
 
-    user_vec = await embed_text(profile_text, is_query=False)
-    vec_literal = _pgvector_literal(user_vec)
+        for cat in hint_cats[:8]:          # cap at 8 categories to stay fast
+            if len(collected) >= limit:
+                break
 
-    rpc_params: dict = {
-        "query_embedding": vec_literal,
-        "match_count": limit,
-        "category_filter": category,
-        "level_filter": None,
-    }
+            qb = db.table("government_schemes").select(
+                "id, scheme_name, slug, details, benefits, eligibility, "
+                "level, scheme_category, tags, application, documents"
+            ).eq("scheme_category", cat if not category else category)
 
-    result = db.rpc("search_schemes_by_embedding", rpc_params).execute()
-    schemes = result.data or []
+            # Prefer Central schemes for broader coverage
+            rows = qb.order("level").limit(per_cat).execute()
+            for row in (rows.data or []):
+                if row["id"] not in seen_ids:
+                    seen_ids.add(row["id"])
+                    collected.append(row)
 
+            if category:
+                break  # only one category requested
+
+        if collected:
+            return {
+                "schemes": collected[:limit],
+                "total": len(collected[:limit]),
+                "recommendation_type": "profile_match",
+            }
+
+    # ── 3. Latest schemes fallback (empty profile) ────────────────────────
+    qb = db.table("government_schemes").select(
+        "id, scheme_name, slug, details, benefits, eligibility, "
+        "level, scheme_category, tags, application, documents"
+    )
+    if category:
+        qb = qb.eq("scheme_category", category)
+
+    fallback = qb.order("created_at", desc=True).limit(limit).execute()
     return {
-        "schemes": schemes,
-        "total": len(schemes),
-        "recommendation_type": "vector_similarity",
+        "schemes": fallback.data or [],
+        "total": len(fallback.data or []),
+        "recommendation_type": "popular",
     }
 
 
@@ -174,27 +272,22 @@ async def list_schemes(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=50),
 ):
-    """
-    List schemes with optional category/level filters and full-text search.
-    For semantic search use GET /schemes/search?q=... instead.
-    """
     db = get_supabase()
     offset = (page - 1) * page_size
 
-    q = db.table("government_schemes").select(
+    qb = db.table("government_schemes").select(
         "id, scheme_name, slug, details, benefits, eligibility, level, scheme_category, tags, application, documents"
     )
 
     if category:
-        q = q.eq("scheme_category", category)
+        qb = qb.eq("scheme_category", category)
     if level:
-        q = q.eq("level", level)
+        qb = qb.eq("level", level)
     if query:
-        # tsvector full-text search (fast, keyword-based)
-        q = q.text_search("search_vector", query)
+        qb = qb.text_search("search_vector", query)
 
-    q = q.range(offset, offset + page_size - 1)
-    result = q.execute()
+    qb = qb.range(offset, offset + page_size - 1)
+    result = qb.execute()
 
     return {
         "schemes": result.data or [],
@@ -207,14 +300,16 @@ async def list_schemes(
 async def get_my_eligible_schemes(
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Get schemes from the eligibility cache (Groq LLM computed).
-    Falls back to vector recommendations if cache is empty.
-    """
     db = get_supabase()
     user_id = str(current_user["id"])
 
-    cache_result = db.table("user_eligibility").select("scheme_id").eq("user_id", user_id).limit(1).execute()
+    cache_result = (
+        db.table("user_eligibility")
+        .select("scheme_id")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
 
     if not cache_result.data:
         await refresh_user_eligibility(user_id, db)
@@ -263,7 +358,6 @@ async def get_scheme_by_slug(
 
     scheme = result.data
 
-    # Attach eligibility from cache (non-blocking if missing)
     elig_result = (
         db.table("user_eligibility")
         .select("eligible, eligibility_reason")
@@ -272,10 +366,10 @@ async def get_scheme_by_slug(
         .execute()
     )
     if elig_result.data:
-        scheme["eligible"] = elig_result.data[0]["eligible"]
-        scheme["eligibility_reason"] = elig_result.data[0]["eligibility_reason"]
+        scheme["eligible"]            = elig_result.data[0]["eligible"]
+        scheme["eligibility_reason"]  = elig_result.data[0]["eligibility_reason"]
 
-    # Attach AI summary (cached — fast on repeat visits)
+    # AI summary — cached after first call, fast on repeat visits
     try:
         ai = await get_or_create_summary(scheme, db)
         scheme["summary"]            = ai.get("summary", "")
@@ -283,7 +377,7 @@ async def get_scheme_by_slug(
         scheme["eligibility_simple"] = ai.get("eligibility_simple", "")
         scheme["documents_simple"]   = ai.get("documents_simple", "")
     except Exception:
-        pass  # never block page load if summarizer fails
+        pass
 
     return scheme
 
@@ -293,10 +387,6 @@ async def get_scheme_summary(
     slug: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Return (or generate + cache) the AI-simplified summary for a scheme.
-    Used by the frontend when it needs to refresh the summary independently.
-    """
     db = get_supabase()
     result = (
         db.table("government_schemes")
