@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
 from app.utils.auth import get_current_user
-from app.routers import auth, users, documents, schemes, applications
 
 app = FastAPI(
     title="GovAssist API",
