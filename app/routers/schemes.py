@@ -1,3 +1,4 @@
+import re
 from fastapi import APIRouter, Depends, Query, BackgroundTasks, HTTPException
 from typing import Optional
 from app.utils.auth import get_current_user
@@ -20,16 +21,15 @@ _SCHEME_COLS = (
     "level, scheme_category, tags, application, documents"
 )
 
-# Occupation → relevant categories
 _OCC_CATEGORIES: dict[str, list[str]] = {
-    "farmer":       ["Agriculture", "Financial Inclusion", "Housing"],
-    "student":      ["Education", "Scholarship", "Skill Development"],
-    "business":     ["Business & MSME", "Financial Inclusion", "Skill Development"],
-    "labourer":     ["Social Welfare", "Employment", "Health"],
-    "self-employed":["Business & MSME", "Financial Inclusion"],
-    "unemployed":   ["Employment", "Skill Development", "Social Welfare"],
-    "government":   ["Pension", "Health", "Housing"],
-    "teacher":      ["Education", "Pension"],
+    "farmer":        ["Agriculture", "Financial Inclusion", "Housing"],
+    "student":       ["Education", "Scholarship", "Skill Development"],
+    "business":      ["Business & MSME", "Financial Inclusion", "Skill Development"],
+    "labourer":      ["Social Welfare", "Employment", "Health"],
+    "self-employed": ["Business & MSME", "Financial Inclusion"],
+    "unemployed":    ["Employment", "Skill Development", "Social Welfare"],
+    "government":    ["Pension", "Health", "Housing"],
+    "teacher":       ["Education", "Pension"],
 }
 
 _CASTE_CATEGORIES: dict[str, list[str]] = {
@@ -40,8 +40,78 @@ _CASTE_CATEGORIES: dict[str, list[str]] = {
 }
 
 
-def _pgvector_literal(vec: list[float]) -> str:
-    return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _to_tsquery(q: str) -> str:
+    """
+    Convert a plain user query into a valid Postgres tsquery expression.
+    Strips special chars, joins words with & (AND).
+
+    "single parent"  →  "single & parent"
+    "widow's scheme" →  "widow & s & scheme"  (apostrophe stripped)
+    """
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", q)
+    tokens  = [t for t in cleaned.split() if len(t) > 1]   # skip 1-char noise
+    if not tokens:
+        return "scheme"
+    return " & ".join(tokens)
+
+
+def _ilike_search(db, q: str, limit: int, category: Optional[str], level: Optional[str]) -> list[dict]:
+    """
+    Last-resort keyword search via ilike — never fails regardless of query format.
+    Tries scheme_name first, then details.
+    """
+    keyword = q.strip().split()[0] if q.strip() else "scheme"
+
+    qb = db.table("government_schemes").select(_SCHEME_COLS)
+    if category:
+        qb = qb.eq("scheme_category", category)
+    if level:
+        qb = qb.eq("level", level)
+    rows = qb.ilike("scheme_name", f"%{keyword}%").limit(limit).execute()
+
+    if rows.data:
+        return rows.data
+
+    # broaden to details column
+    qb2 = db.table("government_schemes").select(_SCHEME_COLS)
+    if category:
+        qb2 = qb2.eq("scheme_category", category)
+    rows2 = qb2.ilike("details", f"%{keyword}%").limit(limit).execute()
+    return rows2.data or []
+
+
+def _search(db, q: str, limit: int, category: Optional[str], level: Optional[str]) -> list[dict]:
+    """
+    Multi-layer search strategy (no ONNX — not viable on Vercel lambdas):
+
+    1. Postgres full-text search (tsvector) — fast, stemmed, ranked.
+    2. ilike fallback — catches cases where tsquery has no matches.
+
+    IMPORTANT (supabase-py 2.x):
+      text_search() returns SyncQueryRequestBuilder which only supports
+      .execute().  All filters and modifiers MUST be chained before it.
+    """
+    tsq = _to_tsquery(q)
+
+    try:
+        qb = db.table("government_schemes").select(_SCHEME_COLS)
+        if category:
+            qb = qb.eq("scheme_category", category)
+        if level:
+            qb = qb.eq("level", level)
+        # limit BEFORE text_search — cannot chain after
+        qb     = qb.limit(limit)
+        result = qb.text_search("search_vector", tsq).execute()
+        data   = result.data or []
+        if data:
+            return data
+    except Exception:
+        pass
+
+    # tsvector returned nothing or errored — fall back to ilike
+    return _ilike_search(db, q, limit, category, level)
 
 
 def _profile_category_hints(user: dict) -> list[str]:
@@ -72,7 +142,7 @@ def _profile_category_hints(user: dict) -> list[str]:
 
     cats.extend(["Health", "Employment", "Social Welfare"])
 
-    seen: set[str] = set()
+    seen:    set[str]  = set()
     ordered: list[str] = []
     for c in cats:
         if c not in seen:
@@ -81,30 +151,7 @@ def _profile_category_hints(user: dict) -> list[str]:
     return ordered
 
 
-def _fulltext_search(db, q: str, limit: int, category: Optional[str], level: Optional[str]) -> list[dict]:
-    """
-    supabase-py 2.x: text_search() returns a SyncQueryRequestBuilder which
-    does NOT support further chaining (.limit, .range, .eq after it).
-    Work around this by building all filters BEFORE calling text_search,
-    then call text_search last — it IS the terminal call before .execute().
-    """
-    qb = db.table("government_schemes").select(_SCHEME_COLS)
-
-    # Apply all chainable filters first
-    if category:
-        qb = qb.eq("scheme_category", category)
-    if level:
-        qb = qb.eq("level", level)
-
-    # limit must also come before text_search in supabase-py 2.x
-    qb = qb.limit(limit)
-
-    # text_search is terminal — no more chaining after this
-    result = qb.text_search("search_vector", q).execute()
-    return result.data or []
-
-
-# ── endpoints ────────────────────────────────────────────────────────────────
+# ── endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/categories")
 async def list_categories():
@@ -112,35 +159,19 @@ async def list_categories():
 
 
 @router.get("/search")
-async def vector_search(
+async def search_schemes(
     q: str = Query(..., min_length=1),
     limit: int = Query(20, ge=1, le=50),
     category: Optional[str] = Query(None),
     level: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
-
-    # ── try pgvector path ─────────────────────────────────────────────────
-    try:
-        from app.services.embeddings import embed_text
-        import asyncio
-        query_vec   = await asyncio.wait_for(embed_text(q, is_query=True), timeout=8.0)
-        vec_literal = _pgvector_literal(query_vec)
-        result = db.rpc("search_schemes_by_embedding", {
-            "query_embedding": vec_literal,
-            "match_count":     limit,
-            "category_filter": category,
-            "level_filter":    level,
-        }).execute()
-        schemes = result.data or []
-        if schemes:
-            return {"schemes": schemes, "query": q, "total": len(schemes), "search_type": "vector"}
-    except Exception:
-        pass  # fall through
-
-    # ── tsvector fallback ─────────────────────────────────────────────────
-    schemes = _fulltext_search(db, q, limit, category, level)
+    """
+    Full-text search over government schemes.
+    Uses Postgres tsvector with ilike fallback — no ONNX/ML dependency.
+    """
+    db      = get_supabase()
+    schemes = _search(db, q, limit, category, level)
     return {"schemes": schemes, "query": q, "total": len(schemes), "search_type": "fulltext"}
 
 
@@ -150,25 +181,31 @@ async def recommend_for_user(
     category: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
+    """
+    Personalised recommendations — three-tier strategy:
+    1. LLM-verified eligibility cache (most accurate)
+    2. Rule-based profile→category matching (instant, no ML)
+    3. Latest schemes fallback (empty profile)
+    """
+    db      = get_supabase()
     user_id = str(current_user["id"])
 
     # ── 1. LLM eligibility cache ──────────────────────────────────────────
-    elig_result = (
+    elig = (
         db.table("user_eligibility")
         .select("scheme_id, eligibility_reason, eligible")
         .eq("user_id", user_id)
         .eq("eligible", True)
         .execute()
     )
-    if elig_result.data:
-        eligible_ids = [r["scheme_id"] for r in elig_result.data]
-        reason_map   = {r["scheme_id"]: r.get("eligibility_reason", "") for r in elig_result.data}
+    if elig.data:
+        eligible_ids = [r["scheme_id"] for r in elig.data]
+        reason_map   = {r["scheme_id"]: r.get("eligibility_reason", "") for r in elig.data}
 
         qb = db.table("government_schemes").select(_SCHEME_COLS).in_("id", eligible_ids)
         if category:
             qb = qb.eq("scheme_category", category)
-        rows = qb.limit(limit).execute()
+        rows    = qb.limit(limit).execute()
         schemes = rows.data or []
         for s in schemes:
             s["eligible"]           = True
@@ -190,7 +227,7 @@ async def recommend_for_user(
                 db.table("government_schemes")
                 .select(_SCHEME_COLS)
                 .eq("scheme_category", target_cat)
-                .order("level")          # Central first
+                .order("level")
                 .limit(per_cat)
                 .execute()
             )
@@ -202,37 +239,45 @@ async def recommend_for_user(
                 break
 
         if collected:
-            return {"schemes": collected[:limit], "total": len(collected[:limit]), "recommendation_type": "profile_match"}
+            return {
+                "schemes": collected[:limit],
+                "total":   len(collected[:limit]),
+                "recommendation_type": "profile_match",
+            }
 
     # ── 3. Latest schemes fallback ────────────────────────────────────────
     qb = db.table("government_schemes").select(_SCHEME_COLS)
     if category:
         qb = qb.eq("scheme_category", category)
     fallback = qb.order("created_at", desc=True).limit(limit).execute()
-    return {"schemes": fallback.data or [], "total": len(fallback.data or []), "recommendation_type": "popular"}
+    return {
+        "schemes": fallback.data or [],
+        "total":   len(fallback.data or []),
+        "recommendation_type": "popular",
+    }
 
 
 @router.get("/")
 async def list_schemes(
-    category: Optional[str] = Query(None),
-    level: Optional[str] = Query(None),
-    query: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
+    category:  Optional[str] = Query(None),
+    level:     Optional[str] = Query(None),
+    query:     Optional[str] = Query(None),
+    page:      int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=50),
 ):
-    db = get_supabase()
+    db     = get_supabase()
     offset = (page - 1) * page_size
 
     if query:
-        # text_search must be the last chain call — apply all other filters first
+        # All modifiers BEFORE text_search (supabase-py 2.x constraint)
         qb = db.table("government_schemes").select(_SCHEME_COLS)
         if category:
             qb = qb.eq("scheme_category", category)
         if level:
             qb = qb.eq("level", level)
-        # range() is not available after text_search, so use limit + offset workaround
-        qb = qb.limit(page_size).offset(offset)
-        result = qb.text_search("search_vector", query).execute()
+        qb     = qb.limit(page_size).offset(offset)
+        tsq    = _to_tsquery(query)
+        result = qb.text_search("search_vector", tsq).execute()
     else:
         qb = db.table("government_schemes").select(_SCHEME_COLS)
         if category:
@@ -248,26 +293,26 @@ async def list_schemes(
 async def get_my_eligible_schemes(
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
+    db      = get_supabase()
     user_id = str(current_user["id"])
 
-    cache_result = (
+    cache = (
         db.table("user_eligibility")
         .select("scheme_id")
         .eq("user_id", user_id)
         .limit(1)
         .execute()
     )
-    if not cache_result.data:
+    if not cache.data:
         await refresh_user_eligibility(user_id, db)
 
     eligible = await get_eligible_schemes(user_id, db)
-    schemes = []
+    schemes  = []
     for row in eligible:
-        scheme_data = row.get("government_schemes", {})
-        if scheme_data:
+        sd = row.get("government_schemes", {})
+        if sd:
             schemes.append({
-                **scheme_data,
+                **sd,
                 "eligible":           row.get("eligible", True),
                 "eligibility_reason": row.get("eligibility_reason", ""),
             })
@@ -279,7 +324,7 @@ async def refresh_eligibility(
     bg: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
+    db      = get_supabase()
     user_id = str(current_user["id"])
     bg.add_task(refresh_user_eligibility, user_id, db)
     return {"message": "Eligibility refresh started", "user_id": user_id}
@@ -290,7 +335,7 @@ async def get_scheme_by_slug(
     slug: str,
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
+    db     = get_supabase()
     result = (
         db.table("government_schemes")
         .select("*")
@@ -303,16 +348,16 @@ async def get_scheme_by_slug(
 
     scheme = result.data
 
-    elig_result = (
+    elig = (
         db.table("user_eligibility")
         .select("eligible, eligibility_reason")
         .eq("user_id", str(current_user["id"]))
         .eq("scheme_id", str(scheme["id"]))
         .execute()
     )
-    if elig_result.data:
-        scheme["eligible"]           = elig_result.data[0]["eligible"]
-        scheme["eligibility_reason"] = elig_result.data[0]["eligibility_reason"]
+    if elig.data:
+        scheme["eligible"]           = elig.data[0]["eligible"]
+        scheme["eligibility_reason"] = elig.data[0]["eligibility_reason"]
 
     try:
         ai = await get_or_create_summary(scheme, db)
@@ -331,7 +376,7 @@ async def get_scheme_summary(
     slug: str,
     current_user: dict = Depends(get_current_user),
 ):
-    db = get_supabase()
+    db     = get_supabase()
     result = (
         db.table("government_schemes")
         .select("*")
